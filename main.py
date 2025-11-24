@@ -1,144 +1,110 @@
-"""Run dimensionality reduction experiment."""
-
-import argparse
-import logging
-
+import hydra
+import torch
+import traceback
+import wandb
 import networkx as nx
 import numpy as np
-import torch
+from omegaconf import DictConfig, OmegaConf
+from threadpoolctl import threadpool_limits
 
-import geom.hyperboloid as hyperboloid
-import geom.poincare as poincare
-from learning.frechet import Frechet
-from learning.pca import TangentPCA, EucPCA, PGA, HoroPCA, BSA
-from hyperbolic_math.src.utils.horo_pca import HoroPCA as HoroPCA_ours
-from hyperbolic_math.src.manifolds import PoincareBall
-from utils.data import load_graph, load_embeddings
-from utils.metrics import avg_distortion_measures, compute_metrics, format_metrics, aggregate_metrics
+from original_horopca import BSA, PGA, HoroPCA
+from utils.evaluation import evaluation
+from utils.dataloader import load_graph, load_poincare_embeddings
 from utils.sarkar import sarkar, pick_root
+from hyperbolic_math.src.manifolds import Hyperboloid, PoincareBall
+from hyperbolic_math.src.utils.helpers import compute_pairwise_distances
+from hyperbolic_math.src.utils.horo_pca import compute_frechet_mean, frechet_center_data
+from hyperbolic_math.src.utils.horo_pca import HoroPCA as HoroPCA_ours
 
-parser = argparse.ArgumentParser(
-    description="Hyperbolic dimensionality reduction"
-)
-parser.add_argument('--dataset', type=str, help='which datasets to use', default="smalltree",
-                    choices=["smalltree", "phylo-tree", "bio-diseasome", "ca-CSphd"])
-parser.add_argument('--model', type=str, help='which dimensionality reduction method to use', default="horopca",
-                    choices=["pca", "tpca", "pga", "bsa", "hmds", "horopca_chami", "horopca_ours"])
-parser.add_argument('--metrics', nargs='+', help='which metrics to use', default=["distortion", "frechet_var"])
-parser.add_argument(
-    "--dim", default=10, type=int, help="input embedding dimension to use"
-)
-parser.add_argument(
-    "--n-components", default=2, type=int, help="number of principal components"
-)
 
-parser.add_argument(
-    "--lr", default=5e-2, type=float, help="learning rate to use for optimization-based methods"
-)
-parser.add_argument(
-    "--n-runs", default=5, type=int, help="number of runs for optimization-based methods"
-)
-parser.add_argument('--use-sarkar', default=False, action='store_true', help="use sarkar to embed the graphs")
-parser.add_argument(
-    "--sarkar-scale", default=3.5, type=float, help="scale to use for embeddings computed with Sarkar's construction"
-)
+@hydra.main(version_base=None, config_path="configs", config_name="config")
+@threadpool_limits.wrap(limits=45, user_api="openmp")
+@threadpool_limits.wrap(limits=1, user_api="blas")
+def main(cfg: DictConfig) -> None:
+    print(cfg, flush=True)
+    run = wandb.init(project=cfg.wandb.project, entity=cfg.wandb.entity, mode='online', config=OmegaConf.to_container(cfg, resolve=True))
+    #TODO: mode=    disabled / 'online'
+    #TODO: python main.py -m seed=44,45,46,47,48 dataset.name=smalltree,phylo_tree,bio_diseasome,ca_CSphd  method=HoroPCA dtype=float32,float64 +poincare_loss=False
+    try:
+        if torch.cuda.is_available():
+            torch.set_default_device('cuda:0')
+
+        poincare = PoincareBall(c=torch.tensor(cfg.curvature), dtype=cfg.dtype)
+        hyperboloid = Hyperboloid(c=torch.tensor(cfg.curvature), dtype=cfg.dtype)
+
+        # Load a graph dataset
+        graph = load_graph(cfg.dataset.name)
+        n_nodes = graph.number_of_nodes()
+        nodelist = np.arange(n_nodes)
+        graph_dist = torch.from_numpy(nx.floyd_warshall_numpy(graph, nodelist=nodelist)).to(torch.get_default_device())
+
+        # Get hyperbolic embeddings
+        if cfg.dataset.use_sarkar:
+            # Embed with Sarkar
+            root = pick_root(graph)
+            z = sarkar(graph, tau=cfg.dataset.sarkar_scale, root=root, dim=cfg.original_dim)
+            z = torch.from_numpy(z).to(torch.get_default_device())
+            z_dist = compute_pairwise_distances(z, poincare) / cfg.dataset.sarkar_scale
+        else:
+            # Load pre-trained embeddings
+            assert cfg.original_dim in [2, 10, 50], "pretrained embeddings are only for 2, 10 and 50 dimensions"
+            z = load_poincare_embeddings(cfg.dataset.name, dim=cfg.original_dim)
+            z = torch.from_numpy(z).to(torch.get_default_device())
+            z_dist = compute_pairwise_distances(z, poincare)
+
+        # Compute the pre-trained/Sarkar embedding distortion
+        indices = torch.triu_indices(z_dist.shape[0], z_dist.shape[0], 1)
+        abs_diff = torch.abs(z_dist - graph_dist)[indices[0], indices[1]]
+        rel_diff = abs_diff / graph_dist[indices[0], indices[1]]
+        run.log({"Initial embedding distortion": torch.mean(rel_diff).item()})
+
+        torch.manual_seed(cfg.seed)
+
+        # Center the data via Fréchet mean
+        # (Hyperboloid centering is best - see ablation study)
+        z_hyper = poincare.to_hyperboloid(z)
+        mean_hyper = compute_frechet_mean(z_hyper, hyperboloid)
+        x_hyper = frechet_center_data(z_hyper, mean_hyper, hyperboloid)
+        x_poincare = hyperboloid.to_poincare(x_hyper)
+
+        if cfg.method == 'BSA':
+            # Dimensionality reduction with BSA
+            model = BSA(dim=cfg.original_dim, n_components=cfg.target_dim, lr=cfg.learning_rate, max_steps=cfg.max_steps, poincare=poincare)
+            model.fit(x_poincare, iterative=False)
+            y = model.transform(x_poincare)
+            evaluation_results = evaluation(x_poincare, y, poincare, metrics=cfg.evaluation)
+        elif cfg.method == 'PGA':
+            # Dimensionality reduction with PGA
+            model = PGA(dim=cfg.original_dim, n_components=cfg.target_dim, lr=cfg.learning_rate, max_steps=cfg.max_steps, poincare=poincare)
+            model.fit(x_poincare, iterative=True)
+            y = model.transform(x_poincare)
+            evaluation_results = evaluation(x_poincare, y, poincare, metrics=cfg.evaluation)
+        elif cfg.method == 'HoroPCA':
+            # Dimensionality reduction with original HoroPCA
+            model = HoroPCA(dim=cfg.original_dim, n_components=cfg.target_dim, lr=cfg.learning_rate, max_steps=cfg.max_steps, poincare=poincare)
+            model.fit(x_poincare, iterative=False)
+            y = model.transform(x_poincare)
+            evaluation_results = evaluation(x_poincare, y, poincare, metrics=cfg.evaluation)
+        elif cfg.method == 'HoroPCA++':
+            # Dimensionality reduction with HoroPCA++
+            model = HoroPCA_ours(n_components=cfg.target_dim, n_in_features=cfg.original_dim+1, manifold=hyperboloid, lr=cfg.learning_rate, max_steps=cfg.max_steps)
+            model.fit(x_hyper, center_data=False)
+            #y = model.transform(x_hyper, center_data=False)
+            #evaluation_results = evaluation(x_poincare, y, poincare, metrics=cfg.evaluation)
+            y_hyper = model.transform(x_hyper, center_data=False)
+            evaluation_results = evaluation(x_hyper, y_hyper, hyperboloid, metrics=cfg.evaluation)
+            print(evaluation_results)
+        else:
+            raise ValueError(f"Unknown method: {cfg.method}")
+
+        run.log(evaluation_results)
+        wandb.finish()
+
+    except Exception as e:
+        wandb.finish(exit_code=-1)
+        print(f"Error occurred: {e}", flush=True)
+        traceback.print_exc()
+        raise
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        format="%(asctime)s %(levelname)-8s %(message)s",
-        level=logging.INFO,
-        datefmt="%Y-%m-%d %H:%M:%S"
-    )
-    args = parser.parse_args()
-    torch.set_default_dtype(torch.float64)
-
-    pca_models = {
-        'pca': {'class': EucPCA, 'optim': False, 'iterative': False, "n_runs": 1},
-        'tpca': {'class': TangentPCA, 'optim': False, 'iterative': False, "n_runs": 1},
-        'pga': {'class': PGA, 'optim': True, 'iterative': True, "n_runs": args.n_runs},
-        'bsa': {'class': BSA, 'optim': True, 'iterative': False, "n_runs": args.n_runs},
-        'horopca_chami': {'class': HoroPCA, 'optim': True, 'iterative': False, "n_runs": args.n_runs},
-        'horopca_ours': {'class': HoroPCA_ours, 'optim': True, 'iterative': False, "n_runs": args.n_runs},
-    }
-    metrics = {}
-    embeddings = {}
-    logging.info(f"Running experiments for {args.dataset} dataset.")
-
-    # load a graph args.dataset
-    graph = load_graph(args.dataset)
-    n_nodes = graph.number_of_nodes()
-    nodelist = np.arange(n_nodes)
-    graph_dist = torch.from_numpy(nx.floyd_warshall_numpy(graph, nodelist=nodelist))
-    logging.info(f"Loaded {args.dataset} dataset with {n_nodes} nodes")
-
-    # get hyperbolic embeddings
-    if args.use_sarkar:
-        # embed with Sarkar
-        logging.info("Using sarkar embeddings")
-        root = pick_root(graph)
-        z = sarkar(graph, tau=args.sarkar_scale, root=root, dim=args.dim)
-        z = torch.from_numpy(z)
-        z_dist = poincare.pairwise_distance(z) / args.sarkar_scale
-    else:
-        # load pre-trained embeddings
-        logging.info("Using optimization-based embeddings")
-        assert args.dim in [2, 10, 50], "pretrained embeddings are only for 2, 10 and 50 dimensions"
-        z = load_embeddings(args.dataset, dim=args.dim)
-        z = torch.from_numpy(z)
-        z_dist = poincare.pairwise_distance(z)
-    if torch.cuda.is_available():
-        z = z.cuda()
-        z_dist = z_dist.cuda()
-        graph_dist = graph_dist.cuda()
-
-    # compute embeddings' distortion
-    distortion = avg_distortion_measures(graph_dist, z_dist)[0]
-    logging.info("Embedding distortion in {} dimensions: {:.4f}".format(args.dim, distortion))
-
-    # Compute the mean and center the data
-    logging.info("Computing the Frechet mean to center the embeddings")
-    frechet = Frechet(lr=1e-2, eps=1e-5, max_steps=5000)
-    mu_ref, has_converged = frechet.mean(z, return_converged=True)
-    logging.info(f"Mean computation has converged: {has_converged}")
-    x = poincare.reflect_at_zero(z, mu_ref)
-
-    # Run dimensionality reduction methods
-    logging.info(f"Running {args.model} for dimensionality reduction")
-    seed = 43
-    torch.manual_seed(seed)
-    torch.use_deterministic_algorithms(True)
-    metrics = []
-    dist_orig = poincare.pairwise_distance(x)
-    if args.model in pca_models.keys():
-        model_params = pca_models[args.model]
-        for _ in range(5):
-            if args.model == 'horopca_ours':
-                if torch.cuda.is_available():
-                    torch.set_default_device('cuda:0')
-                manifold = PoincareBall(torch.tensor(1.0, dtype=torch.float64), dtype=torch.float64)
-                model = HoroPCA_ours(n_components=args.n_components, n_in_features=args.dim, manifold=manifold, lr=args.lr, max_steps=500)
-                model.fit(z)
-                embeddings = model.transform(z)
-                metrics.append(compute_metrics(x, embeddings))
-            else:
-                model = model_params['class'](dim=args.dim, n_components=args.n_components, lr=args.lr, max_steps=500)
-                if torch.cuda.is_available():
-                    model.cuda()
-                model.fit(x, iterative=model_params['iterative'], optim=model_params['optim'])
-                metrics.append(model.compute_metrics(x))
-        metrics = aggregate_metrics(metrics)
-    else:
-        # run hMDS baseline
-        logging.info(f"Running hMDS")
-        x_hyperboloid = hyperboloid.from_poincare(x)
-        distances = hyperboloid.distance(x.unsqueeze(-2), x.unsqueeze(-3))
-        D_p = poincare.pairwise_distance(x)
-        x_h = hyperboloid.mds(D_p, d=args.n_components)
-        x_proj = hyperboloid.to_poincare(x_h)
-        embeddings["hMDS"] = x_proj.numpy()
-        metrics = compute_metrics(x, x_proj)
-    logging.info(f"Experiments for {args.dataset} dataset completed.")
-    logging.info("Computing evaluation metrics")
-    results = format_metrics(metrics, args.metrics)
-    for line in results:
-        logging.info(line)
+    main()

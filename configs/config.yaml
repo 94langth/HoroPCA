@@ -1,0 +1,34 @@
+# Experiment parameters
+method: 'BSA' # 'BSA', 'PGA', 'HoroPCA', 'HoroPCA++'
+dtype: 'float64' # 'float32', 'float64'
+seed: 44
+original_dim: 10
+target_dim: 2
+learning_rate: 0.05
+max_steps: 500
+curvature: 1.0
+
+## Datasets
+dataset:
+  name: 'smalltree' #   smalltree, phylo_tree, bio_diseasome, ca_CSphd
+  use_sarkar: False
+  sarkar_scale: 3.5
+
+## Evaluation Metrics
+evaluation:
+  distortion: True            # Average Distortion (average relative error)
+  distortion_sq: True         # Average Squared Distortion (average squared relative error)
+  distortion_wc: True         # Worst-Case Distortion (maximum relative error)
+  mse_error: True             # Mean Squared Error
+  avg_L1_error: True          # Average L1 Error
+  frechet_var: True           # Fréchet Variance
+  generalized_variance: True  # Generalized Variance (optimization loss)
+
+## Logging
+wandb:
+  project: 'horopca_experiments'
+  entity: 'thomas-lang'
+
+defaults:
+  - _self_
+  - override hydra/job_logging: disabled
